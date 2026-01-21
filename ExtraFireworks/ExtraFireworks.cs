@@ -1,149 +1,157 @@
 using System.Collections.Generic;
 using System.Reflection;
 using BepInEx;
-using R2API;
-using R2API.Utils;
+using BepInEx.Bootstrap;
+using ExtraFireworks.Items;
 using RoR2;
 using UnityEngine;
 
+[assembly: HG.Reflection.SearchableAttribute.OptIn]
+
 namespace ExtraFireworks
 {
-    [BepInDependency(R2API.R2API.PluginGUID)]
-    [BepInDependency(VoidItemAPI.VoidItemAPI.MODGUID)]
+    [BepInDependency("com.rune580.riskofoptions", BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency("com.bepis.r2api.content_management", BepInDependency.DependencyFlags.HardDependency)]
+    [BepInDependency("com.bepis.r2api.items", BepInDependency.DependencyFlags.HardDependency)]
+    [BepInDependency("com.bepis.r2api.language", BepInDependency.DependencyFlags.HardDependency)]
+    [BepInDependency("com.bepis.r2api.prefab", BepInDependency.DependencyFlags.HardDependency)]
+    [BepInDependency("com.bepis.r2api", BepInDependency.DependencyFlags.HardDependency)]
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
     public class ExtraFireworks : BaseUnityPlugin
     {
         public const string PluginGUID = PluginAuthor + "." + PluginName;
         public const string PluginAuthor = "PhysicsFox";
         public const string PluginName = "ExtraFireworks";
-        public const string PluginVersion = "1.5.3";
+        public const string PluginVersion = "1.6.0";
 
         public static GameObject fireworkLauncherPrefab;
         public static GameObject fireworkPrefab;
-        private static List<FireworkItem> items;
+        internal static List<ItemBase> items = [];
+
+        public static bool RooInstalled => Chainloader.PluginInfos.ContainsKey("com.rune580.riskofoptions");
+
+        public static ExtraFireworks instance { get; private set; }
 
         public void Awake()
         {
-            //Init our logging class so that we can properly log for debugging
+            instance = this;
+
             Log.Init(Logger);
-            
+
             fireworkLauncherPrefab = LegacyResourcesAPI.Load<GameObject>("Prefabs/FireworkLauncher");
             fireworkPrefab = fireworkLauncherPrefab.GetComponent<FireworkLauncher>().projectilePrefab;
 
             //Define all the items
-            items = new List<FireworkItem>
-            {
-                new ItemFireworkAbility(this, Config),
-                new ItemFireworkDaisy(this, Config),
-                new ItemFireworkDrones(this, Config),
-                new ItemFireworkMushroom(this, Config),
-                new ItemFireworkOnHit(this, Config),
-                new ItemFireworkOnKill(this, Config),
-                new ItemFireworkFinale(this, Config)
-            };
-
-            var fireworkVoidItem = new ItemFireworkVoid(this, Config);
-            var fireworkVoidItemConsumed = new ItemFireworkVoidConsumed(this, Config, fireworkVoidItem);
-            fireworkVoidItem.ConsumedItem = fireworkVoidItemConsumed;
-            items.Add(fireworkVoidItem);
-            items.Add(fireworkVoidItemConsumed);
+            new FireworkAbility();
+            new FireworkDaisy();
+            new FireworkDrones();
+            new FireworkGrandFinale();
+            new FireworkMushroom();
+            new FireworkOnHit();
+            new FireworkOnKill();
+            new PowerWorksVoid();
 
             // Load assetpack and initialize
-            using (var stream = Assembly.GetExecutingAssembly()
-                       .GetManifestResourceStream("ExtraFireworks.extrafireworks"))
+            var bundle = AssetBundle.LoadFromFile(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(Info.Location), "extrafireworks"));
+            foreach (var item in items)
             {
-                var bundle = AssetBundle.LoadFromStream(stream);
-                foreach (var item in items)
-                    item.Init(bundle);
+                // only enabled items are in this list
+                item.Init(bundle);
             }
-
-            // Bypass 3D model scaling
-            On.RoR2.PickupDisplay.RebuildModel += (orig, self, modelObjectOverride) =>
-            {
-                orig(self, modelObjectOverride);
-
-                if (self.pickupIndex == null || self.pickupIndex.pickupDef == null 
-                    || self.modelObject && self.modelObject.name == "PickupMystery(Clone)" // edge case where item in trishop
-                    || self.highlight && self.highlight.name == "CommandCube(Clone)") // edge case where item turns into command essence
-                    return;
-
-                foreach (var item in items)
-                    if (item.IsEnabled() && self.pickupIndex.pickupDef.itemTier == item.Item.tier
-                        && self.pickupIndex.pickupDef.itemIndex == item.Item.itemIndex)
-                    {
-                        self.modelObject.transform.localScale *= item.GetModelScale();
-                        break;
-                    }
-            };
             
             // This line of log will appear in the bepinex console when the Awake method is done.
             Log.LogInfo(nameof(Awake) + " done.");
         }
-        
-        public void OnEnable()
-        {
-            foreach (var item in items)
-                if (item.IsEnabled())
-                    item.OnEnable();
-        }
-
-        public void OnDisable()
-        {
-            foreach (var item in items)
-                if (item.IsEnabled())
-                    item.OnDisable();
-        }
-
-        private void FixedUpdate()
-        {
-            foreach (var item in items)
-                if (item.IsEnabled())
-                    item.FixedUpdate();
-        }
 
         public static FireworkLauncher FireFireworks(CharacterBody owner, int count)
         {
-            var fl = SpawnFireworks(owner.coreTransform, owner, count);
-            fl.gameObject.transform.parent = owner.coreTransform;
-            return fl;
+            if (!owner)
+                return null;
+
+            var transform = owner.coreTransform ?? owner.transform;
+            var fireworkLauncher = SpawnFireworks(transform, owner, count);
+            fireworkLauncher.transform.parent = transform;
+
+            return fireworkLauncher;
         }
 
         // Firework item formula: 4 + 4 * stack
         public static FireworkLauncher SpawnFireworks(Transform target, CharacterBody owner, int count, bool attach = true)
         {
-            ModelLocator locator = target.GetComponent<ModelLocator>();
-            Transform located = null;
-            if (locator && locator.modelTransform)
+            if (!owner || !target)
+                return null;
+
+            var position = target.position + (Vector3.up * 2f);
+            if (target.TryGetComponent<ModelLocator>(out var locator) && locator.modelTransform && locator.modelTransform.TryGetComponent<ChildLocator>(out var loc))
             {
-                var chLoc = locator.modelTransform.GetComponent<ChildLocator>();
-                if (chLoc)
-                    located = chLoc.FindChild("FireworkOrigin");
+                var located = loc.FindChild("FireworkOrigin");
+                if (located)
+                    position = located.position;
             }
-            Vector3 position = located ? located.position : (target.position + Vector3.up * 2f);
-            
-            var body = target.GetComponent<CharacterBody>();
-            if (body)
+
+            if (target.TryGetComponent<CharacterBody>(out var body))
                 position += Vector3.up * body.radius;
             
-            var fl = CreateLauncher(owner, position, count);
+            var fireworkLauncher = CreateLauncher(owner, position, count);
             if (attach)
-                fl.gameObject.transform.parent = target;
+                fireworkLauncher.transform.parent = target;
             
-            return fl;
+            return fireworkLauncher;
         }
 
         public static FireworkLauncher CreateLauncher(CharacterBody owner, Vector3 position, int count)
         {
-            FireworkLauncher fireworkLauncher = Instantiate(fireworkLauncherPrefab, position, Quaternion.identity).GetComponent<FireworkLauncher>();
-            fireworkLauncher.owner = owner?.gameObject;
-            if (owner)
-            {
-                var tc = owner.teamComponent;
-                fireworkLauncher.team = tc ? tc.teamIndex : TeamIndex.None;
-                fireworkLauncher.crit = Util.CheckRoll(owner.crit, owner.master);
-            }
+            if (!owner)
+                return null;
+
+            var fireworkLauncher = Instantiate(fireworkLauncherPrefab, position, Quaternion.identity).GetComponent<FireworkLauncher>();
+
+            fireworkLauncher.owner = owner.gameObject;
+            fireworkLauncher.team = owner.teamComponent.teamIndex;
+            fireworkLauncher.crit = Util.CheckRoll(owner.crit, owner.master);
             fireworkLauncher.remaining = count;
+
             return fireworkLauncher;
+        }
+
+        internal static void ConvertAllRenderersToHopooShader(GameObject objectToConvert, bool onlyMeshes = true)
+        {
+            Renderer[] componentsInChildren = objectToConvert.GetComponentsInChildren<Renderer>();
+            foreach (Renderer renderer in componentsInChildren)
+            {
+                if (!renderer || !renderer.material)
+                {
+                    continue;
+                }
+
+                if (onlyMeshes)
+                {
+                    if (!renderer.GetComponent<LineRenderer>() && !renderer.GetComponent<TrailRenderer>() && !renderer.GetComponent<ParticleSystemRenderer>())
+                    {
+                        ConvertMaterial(renderer.material);
+                    }
+                }
+                else
+                {
+                    ConvertMaterial(renderer.material);
+                }
+            }
+        }
+
+        internal static void ConvertMaterial(Material material)
+        {
+            Texture texture = null;
+            if (material.HasProperty("_BumpMap"))
+            {
+                texture = material.GetTexture("_BumpMap");
+            }
+
+            material.shader = Resources.Load<Shader>("Shaders/Deferred/HGStandard");
+            if (texture != null)
+            {
+                material.SetTexture("_NormalTex", texture);
+                material.SetFloat("_NormalStrength", 1f);
+            }
         }
     }
 }
